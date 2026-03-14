@@ -1,7 +1,6 @@
 import fs from "fs";
 import path from "path";
 import https from "https";
-import http from "http";
 import { createWriteStream, mkdirSync, existsSync } from "fs";
 import { fileURLToPath } from "url";
 import AdmZip from "adm-zip";
@@ -30,25 +29,15 @@ const REPOS = {
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 // Fetch the live version from the running 5etools instance via /package.json
-function fetchLiveVersion(serverUrl) {
-  return new Promise((resolve) => {
+async function fetchLiveVersion(serverUrl) {
+  try {
     const url = serverUrl.replace(/\/$/, "") + "/package.json";
-    const client = url.startsWith("https") ? https : http;
-    const req = client.get(url, { headers: { "User-Agent": "5etools-updater/1.0" } }, (res) => {
-      let data = "";
-      res.on("data", (c) => (data += c));
-      res.on("end", () => {
-        try {
-          const pkg = JSON.parse(data);
-          resolve(pkg.version ?? null);
-        } catch {
-          resolve(null);
-        }
-      });
-    });
-    req.on("error", () => resolve(null));
-    req.setTimeout(3000, () => { req.destroy(); resolve(null); });
-  });
+    const res = await fetch(url, { signal: AbortSignal.timeout(3000) });
+    const pkg = await res.json();
+    return pkg.version ?? null;
+  } catch {
+    return null;
+  }
 }
 
 function loadConfig() {
@@ -92,24 +81,38 @@ function fetchJson(url) {
   });
 }
 
-// Download a single file, updating an existing bar by `sizeMB` increments
-function downloadFilePart(url, destPath, bar, totalDownloadedMB) {
+const PARALLEL_DOWNLOADS = 3;
+
+// Download a single file into destPath, updating its own bar row.
+function downloadFilePart(url, destPath, bar) {
   return new Promise((resolve, reject) => {
+    let bytes = 0;
+    let startTime = Date.now();
+    let lastBytes = 0;
+    let lastTime = startTime;
+
     const follow = (u) => {
       https.get(u, { headers: { "User-Agent": "5etools-updater/1.0" } }, (res) => {
         if (res.statusCode === 301 || res.statusCode === 302) {
           return follow(res.headers.location);
         }
-        let partBytes = 0;
+        const totalMB = Math.round((parseInt(res.headers["content-length"] || 0) / 1024 / 1024) * 10) / 10;
+        if (totalMB) bar.setTotal(totalMB);
+
         const file = createWriteStream(destPath);
         res.on("data", (chunk) => {
-          partBytes += chunk.length;
-          bar.update(
-            Math.round((totalDownloadedMB + partBytes / 1024 / 1024) * 10) / 10
-          );
+          bytes += chunk.length;
+          const now = Date.now();
+          const elapsed = (now - lastTime) / 1000;
+          if (elapsed >= 0.25) {
+            const speedMBs = ((bytes - lastBytes) / 1024 / 1024 / elapsed).toFixed(1);
+            lastBytes = bytes;
+            lastTime = now;
+            bar.update(Math.round((bytes / 1024 / 1024) * 10) / 10, { speed: speedMBs });
+          }
         });
         res.pipe(file);
-        file.on("finish", () => resolve(partBytes));
+        file.on("finish", () => resolve(bytes));
         file.on("error", reject);
       }).on("error", reject);
     };
@@ -117,81 +120,71 @@ function downloadFilePart(url, destPath, bar, totalDownloadedMB) {
   });
 }
 
-// Download one or more assets, showing a single combined progress bar.
+// Download one or more assets with parallel workers and per-file speed bars.
 // Returns the path to the final file to extract (combined if split).
 async function downloadAssets(assets, destDir, baseName) {
-  // Sort split parts: z01, z02, …, zNN, .zip last
   const isSplit = assets.some((a) => /\.z\d+$/.test(a.name));
 
-  if (!isSplit) {
-    // Single file download
-    const asset = assets[0];
-    const destPath = path.join(destDir, asset.name);
-    const bar = new cliProgress.SingleBar(
-      {
-        format:
-          "  Downloading |" + chalk.cyan("{bar}") + "| {percentage}% | {value}/{total} MB",
-        barCompleteChar: "█",
-        barIncompleteChar: "░",
-        hideCursor: true,
-      },
-      cliProgress.Presets.shades_classic
-    );
-    bar.start(asset.sizeMB || 100, 0);
-    await downloadFilePart(asset.url, destPath, bar, 0);
-    bar.stop();
-    return destPath;
-  }
-
-  // Split archive: sort parts z01…zNN then .zip
-  const sorted = [...assets].sort((a, b) => {
-    const extA = a.name.match(/\.(z(\d+)|zip)$/)?.[0] ?? "";
-    const extB = b.name.match(/\.(z(\d+)|zip)$/)?.[0] ?? "";
-    if (extA === ".zip") return 1;
-    if (extB === ".zip") return -1;
-    return extA.localeCompare(extB, undefined, { numeric: true });
-  });
+  // Sort split parts: z01…zNN then .zip
+  const sorted = isSplit
+    ? [...assets].sort((a, b) => {
+        const extA = a.name.match(/\.(z\d+|zip)$/)?.[0] ?? "";
+        const extB = b.name.match(/\.(z\d+|zip)$/)?.[0] ?? "";
+        if (extA === ".zip") return 1;
+        if (extB === ".zip") return -1;
+        return extA.localeCompare(extB, undefined, { numeric: true });
+      })
+    : assets;
 
   const totalMB = Math.round(sorted.reduce((s, a) => s + a.sizeMB, 0) * 10) / 10;
-  console.log(
-    chalk.yellow(
-      `  Split archive detected: ${sorted.length} parts, ~${totalMB} MB total`
-    )
-  );
+  if (isSplit) {
+    console.log(chalk.yellow(`\n  Split archive: ${sorted.length} parts, ~${totalMB} MB total`));
+  }
 
-  const bar = new cliProgress.SingleBar(
+  const multiBar = new cliProgress.MultiBar(
     {
       format:
-        "  Downloading |" +
+        "  {name} |" +
         chalk.cyan("{bar}") +
-        "| {percentage}% | {value}/{total} MB | {filename}",
+        "| {percentage}% {value}/{total} MB  " +
+        chalk.yellow("{speed} MB/s"),
       barCompleteChar: "█",
       barIncompleteChar: "░",
       hideCursor: true,
+      clearOnComplete: false,
+      stopOnComplete: false,
     },
     cliProgress.Presets.shades_classic
   );
-  bar.start(totalMB, 0, { filename: "" });
 
-  const partPaths = [];
-  let downloadedMB = 0;
-  for (const asset of sorted) {
-    bar.update(downloadedMB, { filename: asset.name });
-    const partPath = path.join(destDir, asset.name);
-    partPaths.push(partPath);
-    const bytes = await downloadFilePart(asset.url, partPath, bar, downloadedMB);
-    downloadedMB += bytes / 1024 / 1024;
-  }
-  bar.update(totalMB, { filename: "done" });
-  bar.stop();
+  // Map asset → { destPath, bar }
+  const partPaths = sorted.map((a) => path.join(destDir, a.name));
+  const bars = sorted.map((a) =>
+    multiBar.create(a.sizeMB || 100, 0, { name: a.name.slice(-12).padStart(12), speed: "0.0" })
+  );
 
-  // Concatenate all parts into one .zip
-  console.log(chalk.cyan("\n  Concatenating split parts..."));
+  // Run downloads PARALLEL_DOWNLOADS at a time
+  const queue = sorted.map((asset, i) => ({ asset, index: i }));
+  const workers = Array.from({ length: Math.min(PARALLEL_DOWNLOADS, queue.length) }, async () => {
+    while (queue.length) {
+      const { asset, index } = queue.shift();
+      await downloadFilePart(asset.url, partPaths[index], bars[index]);
+      bars[index].update(bars[index].getTotal(), { speed: "done" });
+    }
+  });
+
+  await Promise.all(workers);
+  multiBar.stop();
+
+  if (!isSplit) return partPaths[0];
+
+  // Concatenate parts in order
+  console.log(chalk.cyan("\n  Concatenating parts..."));
   const combinedPath = path.join(destDir, `${baseName}-combined.zip`);
   const out = createWriteStream(combinedPath);
-  for (const partPath of partPaths) {
+  for (const p of partPaths) {
     await new Promise((resolve, reject) => {
-      const input = fs.createReadStream(partPath);
+      const input = fs.createReadStream(p);
       input.pipe(out, { end: false });
       input.on("end", resolve);
       input.on("error", reject);
@@ -200,9 +193,7 @@ async function downloadAssets(assets, destDir, baseName) {
   await new Promise((resolve) => out.end(resolve));
   console.log(chalk.green("  Parts combined."));
 
-  // Clean up individual parts
   for (const p of partPaths) fs.unlinkSync(p);
-
   return combinedPath;
 }
 
