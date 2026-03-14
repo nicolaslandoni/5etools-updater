@@ -1,6 +1,7 @@
 import fs from "fs";
 import path from "path";
 import https from "https";
+import http from "http";
 import { createWriteStream, mkdirSync, existsSync } from "fs";
 import { fileURLToPath } from "url";
 import AdmZip from "adm-zip";
@@ -26,7 +27,29 @@ const REPOS = {
   },
 };
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+// Fetch the live version from the running 5etools instance via /package.json
+function fetchLiveVersion(serverUrl) {
+  return new Promise((resolve) => {
+    const url = serverUrl.replace(/\/$/, "") + "/package.json";
+    const client = url.startsWith("https") ? https : http;
+    const req = client.get(url, { headers: { "User-Agent": "5etools-updater/1.0" } }, (res) => {
+      let data = "";
+      res.on("data", (c) => (data += c));
+      res.on("end", () => {
+        try {
+          const pkg = JSON.parse(data);
+          resolve(pkg.version ?? null);
+        } catch {
+          resolve(null);
+        }
+      });
+    });
+    req.on("error", () => resolve(null));
+    req.setTimeout(3000, () => { req.destroy(); resolve(null); });
+  });
+}
 
 function loadConfig() {
   return JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
@@ -277,6 +300,12 @@ async function configureServer() {
   const answers = await inquirer.prompt([
     {
       type: "input",
+      name: "serverUrl",
+      message: "5etools server URL (for live version check):",
+      default: cfg.serverUrl,
+    },
+    {
+      type: "input",
       name: "host",
       message: "SFTP Host (IP or hostname):",
       default: cfg.sftp.host,
@@ -308,7 +337,8 @@ async function configureServer() {
     },
   ]);
 
-  cfg.sftp = answers;
+  cfg.serverUrl = answers.serverUrl;
+  cfg.sftp = { host: answers.host, port: answers.port, user: answers.user, password: answers.password, remotePath: answers.remotePath };
   saveConfig(cfg);
   console.log(chalk.green("\n  Configuration saved!"));
   await pause();
@@ -508,18 +538,33 @@ async function runUpdate(key, release, cfg) {
 async function showStatus() {
   header();
   const cfg = loadConfig();
-  console.log(chalk.bold("  Current Configuration\n"));
+
+  process.stdout.write(chalk.cyan("  Checking live server... "));
+  const live = await fetchLiveVersion(cfg.serverUrl);
+  console.log(live ? chalk.green(`v${live}`) : chalk.red("unreachable"));
+  console.log();
+
+  console.log(chalk.bold("  Configuration\n"));
+  console.log(chalk.gray("  Server URL:  ") + chalk.white(cfg.serverUrl));
   console.log(chalk.gray("  SFTP Host:   ") + chalk.white(cfg.sftp.host));
   console.log(chalk.gray("  SFTP Port:   ") + chalk.white(cfg.sftp.port));
   console.log(chalk.gray("  SFTP User:   ") + chalk.white(cfg.sftp.user));
   console.log(chalk.gray("  Remote Path: ") + chalk.white(cfg.sftp.remotePath));
   console.log();
-  console.log(chalk.bold("  Installed Versions\n"));
+
+  console.log(chalk.bold("  Versions\n"));
+  console.log(
+    chalk.gray("  Live (server)".padEnd(32)),
+    live ? chalk.green(`v${live}`) : chalk.red("unreachable")
+  );
   for (const [key, info] of Object.entries(REPOS)) {
     const v = cfg.installedVersions[key];
+    const match = live && v === `v${live}` || live && v && v.replace(/^v/, "") === live;
     console.log(
       chalk.gray(`  ${info.label.padEnd(30)}`),
-      v ? chalk.green(v) : chalk.red("not installed")
+      v
+        ? (match ? chalk.green(v) : chalk.yellow(v))
+        : chalk.red("not installed")
     );
   }
   await pause();
@@ -537,14 +582,20 @@ async function main() {
     const cfg = loadConfig();
     const src = cfg.installedVersions.src;
     const img = cfg.installedVersions.img;
+    const live = await fetchLiveVersion(cfg.serverUrl);
+
+    const liveLabel = live
+      ? chalk.green(`v${live}`)
+      : chalk.red("unreachable");
 
     console.log(
-      chalk.gray("  src: ") +
-        (src ? chalk.green(src) : chalk.red("not installed")) +
+      chalk.gray("  live: ") + liveLabel +
+        chalk.gray("   src: ") +
+        (src ? chalk.cyan(src) : chalk.red("none")) +
         chalk.gray("   img: ") +
-        (img ? chalk.green(img) : chalk.red("not installed")) +
+        (img ? chalk.cyan(img) : chalk.red("none")) +
         chalk.gray("   host: ") +
-        chalk.cyan(cfg.sftp.host) +
+        chalk.white(cfg.sftp.host) +
         "\n"
     );
 
