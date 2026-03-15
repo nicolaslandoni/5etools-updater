@@ -1,9 +1,11 @@
+
 import fs from "fs";
 import path from "path";
 import https from "https";
 import { createWriteStream, mkdirSync, existsSync } from "fs";
+import { spawnSync } from "child_process";
 import { fileURLToPath } from "url";
-import AdmZip from "adm-zip";
+import unzipper from "unzipper";
 import SftpClient from "ssh2-sftp-client";
 import chalk from "chalk";
 import cliProgress from "cli-progress";
@@ -28,15 +30,32 @@ const REPOS = {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+function find7z() {
+  const candidates = process.platform === "win32"
+    ? ["7z", "C:\\Program Files\\7-Zip\\7z.exe", "C:\\Program Files (x86)\\7-Zip\\7z.exe"]
+    : ["7z", "7za", "7zz"];
+  for (const cmd of candidates) {
+    const r = spawnSync(cmd, ["i"], { stdio: "pipe" });
+    if (!r.error) return cmd;
+  }
+  return null;
+}
+
 // Fetch the live version from the running 5etools instance via /package.json
 async function fetchLiveVersion(serverUrl) {
+  const url = serverUrl.replace(/\/$/, "") + "/package.json";
+  let res;
   try {
-    const url = serverUrl.replace(/\/$/, "") + "/package.json";
-    const res = await fetch(url, { signal: AbortSignal.timeout(3000) });
-    const pkg = await res.json();
-    return pkg.version ?? null;
+    res = await fetch(url, { signal: AbortSignal.timeout(3000) });
   } catch {
-    return null;
+    return { reachable: false, version: null };
+  }
+  if (!res.ok) return { reachable: true, version: null };
+  try {
+    const pkg = await res.json();
+    return { reachable: true, version: pkg.version ?? null };
+  } catch {
+    return { reachable: true, version: null };
   }
 }
 
@@ -122,7 +141,7 @@ function downloadFilePart(url, destPath, bar) {
 
 // Download one or more assets with parallel workers and per-file speed bars.
 // Returns the path to the final file to extract (combined if split).
-async function downloadAssets(assets, destDir, baseName) {
+async function downloadAssets(assets, destDir, baseName, { skipConcat = false } = {}) {
   const isSplit = assets.some((a) => /\.z\d+$/.test(a.name));
 
   // Sort split parts: z01…zNN then .zip
@@ -178,6 +197,11 @@ async function downloadAssets(assets, destDir, baseName) {
 
   if (!isSplit) return partPaths[0];
 
+  if (skipConcat) {
+    console.log(chalk.green("  All parts downloaded."));
+    return partPaths[partPaths.length - 1]; // last sorted = .zip anchor for 7z
+  }
+
   // Concatenate parts in order
   console.log(chalk.cyan("\n  Concatenating parts..."));
   const combinedPath = path.join(destDir, `${baseName}-combined.zip`);
@@ -212,6 +236,23 @@ async function getLatestRelease(owner, repo) {
     })),
     zipball: data.zipball_url,
   };
+}
+
+async function getReleases(owner, repo, perPage = 20) {
+  const url = `https://api.github.com/repos/${owner}/${repo}/releases?per_page=${perPage}`;
+  const data = await fetchJson(url);
+  if (!Array.isArray(data)) throw new Error(`GitHub API: ${data.message ?? "unexpected response"}`);
+  return data.map((r) => ({
+    tag: r.tag_name,
+    name: r.name,
+    publishedAt: r.published_at?.slice(0, 10),
+    assets: r.assets.map((a) => ({
+      name: a.name,
+      url: a.browser_download_url,
+      sizeMB: Math.round((a.size / 1024 / 1024) * 10) / 10,
+    })),
+    zipball: r.zipball_url,
+  }));
 }
 
 // ─── SFTP Upload ─────────────────────────────────────────────────────────────
@@ -363,13 +404,18 @@ async function checkUpdates() {
   const cfg = loadConfig();
   console.log(chalk.cyan("  Fetching latest releases from GitHub...\n"));
 
+  // Fetch live server state once so we can detect a wiped www dir
+  const live = await fetchLiveVersion(cfg.serverUrl);
+  const serverEmpty = live.reachable && !live.version;
+
   const results = {};
   for (const [key, info] of Object.entries(REPOS)) {
     process.stdout.write(`  Checking ${info.label}... `);
     try {
       const release = await getLatestRelease(info.owner, info.repo);
       const installed = cfg.installedVersions[key];
-      const isNew = !installed || installed !== release.tag;
+      // Also mark as new if server is up but has no version file (www was wiped)
+      const isNew = !installed || installed !== release.tag || serverEmpty;
       results[key] = { release, installed, isNew };
       if (isNew) {
         console.log(
@@ -403,7 +449,6 @@ async function checkUpdates() {
     }));
 
   if (updateChoices.length === 0) {
-    await pause();
     return;
   }
 
@@ -411,20 +456,57 @@ async function checkUpdates() {
     {
       type: "checkbox",
       name: "toUpdate",
-      message: "Select packages to update:",
+      message: "Select packages to update (uncheck all + Enter to cancel):",
       choices: updateChoices,
     },
   ]);
 
   if (toUpdate.length === 0) {
-    console.log(chalk.yellow("  No packages selected."));
-    await pause();
     return;
   }
 
   for (const key of toUpdate) {
     await runUpdate(key, results[key].release, cfg);
   }
+}
+
+async function installSpecificVersion() {
+  header();
+  console.log(chalk.yellow("  Install Specific Version\n"));
+
+  const { repoKey } = await inquirer.prompt([{
+    type: "list",
+    name: "repoKey",
+    message: "Which repository?",
+    choices: Object.entries(REPOS).map(([k, v]) => ({ name: v.label, value: k })),
+  }]);
+
+  const { owner, repo } = REPOS[repoKey];
+  console.log(chalk.cyan(`\n  Fetching releases for ${REPOS[repoKey].label}...`));
+
+  let releases;
+  try {
+    releases = await getReleases(owner, repo);
+  } catch (err) {
+    console.log(chalk.red(`  Error: ${err.message}`));
+    await pause();
+    return;
+  }
+
+  const cfg = loadConfig();
+
+  const { selectedTag } = await inquirer.prompt([{
+    type: "list",
+    name: "selectedTag",
+    message: "Select a version to install:",
+    choices: releases.map((r) => ({
+      name: `${r.tag.padEnd(20)} ${chalk.gray(r.publishedAt ?? "")}`,
+      value: r.tag,
+    })),
+  }]);
+
+  const release = releases.find((r) => r.tag === selectedTag);
+  await runUpdate(repoKey, release, cfg);
 }
 
 async function runUpdate(key, release, cfg) {
@@ -466,14 +548,69 @@ async function runUpdate(key, release, cfg) {
   const extractDir = path.join(TEMP_DIR, `${key}-${release.tag}`);
   let zipPath;
 
+  const sevenZip = find7z();
+
+  // Pre-sort for reuse check (same sort order as downloadAssets)
+  const sortedParts = isSplit
+    ? [...assetsToDownload].sort((a, b) => {
+        const extA = a.name.match(/\.(z\d+|zip)$/)?.[0] ?? "";
+        const extB = b.name.match(/\.(z\d+|zip)$/)?.[0] ?? "";
+        if (extA === ".zip") return 1;
+        if (extB === ".zip") return -1;
+        return extA.localeCompare(extB, undefined, { numeric: true });
+      })
+    : [];
+  const allPartPaths = sortedParts.map((a) => path.join(TEMP_DIR, a.name));
+
+  // Track files to clean up
+  const filesToClean = new Set();
+
+  // If 7z + split → prefer individual parts (no concat needed)
+  // Otherwise → combined.zip or single file
+  const allPartsPresent = isSplit && sevenZip && allPartPaths.every((p) => existsSync(p));
+  const combinedZipPath = path.join(TEMP_DIR, `${key}-${release.tag}-combined.zip`);
+  const singleFilePath = !isSplit ? path.join(TEMP_DIR, assetsToDownload[0].name) : null;
+
+  if (allPartsPresent) {
+    const totalMB = Math.round(allPartPaths.reduce((s, p) => s + fs.statSync(p).size, 0) / 1024 / 1024 * 10) / 10;
+    console.log(chalk.yellow(`\n  Found ${allPartPaths.length} existing parts (${totalMB} MB)`));
+    const { reuse } = await inquirer.prompt([{ type: "confirm", name: "reuse", message: "Use existing parts and skip download?", default: true }]);
+    if (reuse) {
+      zipPath = allPartPaths[allPartPaths.length - 1];
+      for (const p of allPartPaths) filesToClean.add(p);
+    }
+  } else {
+    const checkPath = isSplit ? combinedZipPath : singleFilePath;
+    if (existsSync(checkPath)) {
+      const sizeMB = Math.round(fs.statSync(checkPath).size / 1024 / 1024 * 10) / 10;
+      console.log(chalk.yellow(`\n  Found existing download: ${path.basename(checkPath)} (${sizeMB} MB)`));
+      const { reuse } = await inquirer.prompt([{ type: "confirm", name: "reuse", message: "Use existing file and skip download?", default: true }]);
+      if (reuse) { zipPath = checkPath; filesToClean.add(checkPath); }
+    }
+  }
+
   try {
-    console.log(chalk.cyan(`\n  Downloading...`));
-    zipPath = await downloadAssets(assetsToDownload, TEMP_DIR, `${key}-${release.tag}`);
+    if (!zipPath) {
+      console.log(chalk.cyan(`\n  Downloading...`));
+      zipPath = await downloadAssets(assetsToDownload, TEMP_DIR, `${key}-${release.tag}`, { skipConcat: isSplit && !!sevenZip });
+      if (isSplit && sevenZip) {
+        for (const p of allPartPaths) filesToClean.add(p);
+      } else {
+        filesToClean.add(zipPath);
+      }
+    }
 
     console.log(chalk.cyan("\n  Extracting..."));
     if (existsSync(extractDir)) fs.rmSync(extractDir, { recursive: true });
-    const zip = new AdmZip(zipPath);
-    zip.extractAllTo(extractDir, true);
+    mkdirSync(extractDir, { recursive: true });
+    if (sevenZip) {
+      console.log(chalk.gray(`  Using 7-Zip...`));
+      const result = spawnSync(sevenZip, ["x", zipPath, `-o${extractDir}`, "-y"], { stdio: "inherit" });
+      if (result.status !== 0) throw new Error("7-Zip extraction failed");
+    } else {
+      const directory = await unzipper.Open.file(zipPath);
+      await directory.extract({ path: extractDir, concurrency: 4 });
+    }
 
     // Unwrap single root folder if GitHub wraps the zip
     const entries = fs.readdirSync(extractDir);
@@ -517,7 +654,7 @@ async function runUpdate(key, release, cfg) {
       },
     ]);
     if (cleanup) {
-      if (existsSync(zipPath)) fs.unlinkSync(zipPath);
+      for (const f of filesToClean) if (existsSync(f)) fs.unlinkSync(f);
       if (existsSync(extractDir)) fs.rmSync(extractDir, { recursive: true });
       console.log(chalk.gray("  Temp files removed."));
     }
@@ -532,7 +669,12 @@ async function showStatus() {
 
   process.stdout.write(chalk.cyan("  Checking live server... "));
   const live = await fetchLiveVersion(cfg.serverUrl);
-  console.log(live ? chalk.green(`v${live}`) : chalk.red("unreachable"));
+  const liveStatusLabel = !live.reachable
+    ? chalk.red("unreachable")
+    : live.version
+      ? chalk.green(`v${live.version}`)
+      : chalk.yellow("no version file");
+  console.log(liveStatusLabel);
   console.log();
 
   console.log(chalk.bold("  Configuration\n"));
@@ -546,11 +688,11 @@ async function showStatus() {
   console.log(chalk.bold("  Versions\n"));
   console.log(
     chalk.gray("  Live (server)".padEnd(32)),
-    live ? chalk.green(`v${live}`) : chalk.red("unreachable")
+    liveStatusLabel
   );
   for (const [key, info] of Object.entries(REPOS)) {
     const v = cfg.installedVersions[key];
-    const match = live && v === `v${live}` || live && v && v.replace(/^v/, "") === live;
+    const match = live.version && (v === `v${live.version}` || (v && v.replace(/^v/, "") === live.version));
     console.log(
       chalk.gray(`  ${info.label.padEnd(30)}`),
       v
@@ -575,9 +717,11 @@ async function main() {
     const img = cfg.installedVersions.img;
     const live = await fetchLiveVersion(cfg.serverUrl);
 
-    const liveLabel = live
-      ? chalk.green(`v${live}`)
-      : chalk.red("unreachable");
+    const liveLabel = !live.reachable
+      ? chalk.red("unreachable")
+      : live.version
+        ? chalk.green(`v${live.version}`)
+        : chalk.yellow("no version file");
 
     console.log(
       chalk.gray("  live: ") + liveLabel +
@@ -600,6 +744,7 @@ async function main() {
           { name: "  Test SFTP connection", value: "test" },
           { name: "  Configure SFTP server", value: "config" },
           { name: "  Show status", value: "status" },
+          { name: "  Install specific version", value: "specific" },
           new inquirer.Separator(),
           { name: "  Exit", value: "exit" },
         ],
@@ -614,6 +759,7 @@ async function main() {
     if (action === "test") await testConnection();
     if (action === "config") await configureServer();
     if (action === "status") await showStatus();
+    if (action === "specific") await installSpecificVersion();
   }
 }
 
